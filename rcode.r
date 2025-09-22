@@ -1,7 +1,3 @@
-############################################################################################################################
-########################## example code for group of articles labelled in Rayyan as "YLL"
-############################################################################################################################
-
 rm(list=ls())
 
 library(tidyr)
@@ -19,251 +15,215 @@ library(reticulate)
 library(bibliometrix)
 library(stringr)
 
+# load the Python script
 use_condaenv("bertopic_env", required = TRUE)
-#use_condaenv("riscluster", required = TRUE)
+source_python("run_bertopic.py")  
 
 
 data.dir <- "your directory"   ##### directory for review data
-keywords.dir <- "your directory" ### directory wuth saved keywords
-selected.dir <-  "your directory" ### dierectory for selected representative and random articles
-
+##########################################################
+#prepare data
 setwd(data.dir)
-ris_data <- read_bibliography("articles.ris") # read data saved from Rayyan
+ris_data <- read_bibliography("articles.ris")
 
 selection <- ris_data %>%
-  mutate(n1_clean = str_remove(n1, fixed('RAYYAN-INCLUSION: {"Magdalena"=>"Included"} | RAYYAN-LABELS: '))) ## only articles labelled as "Included"
+  mutate(n1_clean = str_remove(n1, fixed('RAYYAN-INCLUSION: {"Magdalena"=>"Included"} | RAYYAN-LABELS: ')))
 
 
-selection_yll <- selection %>%
-  filter(str_detect(n1, "\\bYLL\\b"))
 
-df <- selection_yll
+selection_no <- selection %>%
+  filter(!(str_detect(n1, "\\bgbd\\b") |str_detect(n1, "\\bYYL\\b") |str_detect(n1, "\\bhazard\\b") 
+           |str_detect(n1, "\\brisk\\b")|str_detect(n1, "\\bgroup\\b")|str_detect(n1, "\\bexcess\\b")|str_detect(n1, "\\bavoidable\\b")|str_detect(n1, "\\bages\\b")|str_detect(n1, "\\byes\\b")))
+
+
+df <- selection_no
 df$text <- paste(df$title, df$abstract)
 py$docs <- df$text
 
+#############################################################
+####### run the Python script
+####### it is done in two steps: 1.create groups of similar article, 2.for the group of rest articles "-1" create groups again
+###### for each group we select 1. representative article chosen by the program in python; 2. one randomly sampled article
 
 
-py_run_string("
-from bertopic import BERTopic
-from sentence_transformers import SentenceTransformer
-from sklearn.feature_extraction.text import CountVectorizer
-import pandas as pd
+######## step 1
+result <- run_bertopic(py$docs) # call the function
+# extract the results
+topic_info <- result[[1]]
+document_info <- result[[2]]
 
-# Load pre-trained transformer
-model = SentenceTransformer('all-MiniLM-L6-v2')
+# extract representative texts
+rep_text_main <- result[[3]]  # main representative_docs
+example_texts_main <- sapply(rep_text_main, function(x) if (length(x) > 0) x[[1]] else NA)
+example_texts_main <- tolower(example_texts_main)
 
-# Compute embeddings
-embeddings = model.encode(docs, show_progress_bar=True)
+# Match to original data
+match_indices_main <- match(example_texts_main, df$combined_text)
 
-# Fit BERTopic model
-topic_model = BERTopic(verbose=True)
-topics, probs = topic_model.fit_transform(docs, embeddings)
-
-# Store results
-topic_info = topic_model.get_topic_info()
-document_info = pd.DataFrame({'text': docs, 'topic': topics})
-")
-
-# Get document-topic mapping
-str(topics_df)
-topic_assignments <- py$document_info
-topics_df <- as.data.frame(topic_assignments)
-
-# Add to your original R dataframe
-df$topic <- topics_df$topic
+# Add columns to topic_info_main
+topic_info_main <- result[[1]]
+topic_info_main$Representative_Docs <- rep_text_main
+topic_info_main$title <- df$title[match_indices_main]
+topic_info_main$abstract <- df$abstract[match_indices_main]
 
 
 
-###############select first one sub-group, which containts only rubish
-py_run_string("
-import re
-from collections import Counter
-import nltk
-nltk.download('stopwords')
-from nltk.corpus import stopwords
+####### step 2
+#prepare the data
+generic_docs <- df$text[document_info$topic == -1]
+generic_docs <- tolower(generic_docs)
+py$docs_sub <- generic_docs
 
-# Set of English stopwords and exclusions
-english_stopwords = set(stopwords.words('english'))
-exclusions = set(['death', 'deaths', 'mortality', 'premature',  'study','health', 'disease', 'among', 'analysis', 'life', 'based', 'years',
-'associated', 'related', 'care', 'year', 'long', 'data', 'quality',
-'specific', 'effects', 'women', 'outcomes', 'cost', 'impacts',
-'alcohol', 'high', 'potential', 'results', 'time', 'evidence', 'first'])
+result_sub <- run_bertopic(py$docs_sub)
 
-# ISO country list
-import pycountry
-country_names = set([c.name.lower() for c in pycountry.countries])
+topic_info_sub <- result_sub[[1]]
+document_info_sub <- result_sub[[2]]
 
-def get_top_common_words(titles, min_length=4, top_n=10):
-    words = []
-    for title in titles:
-        if title is None:
-            continue
-        tokens = re.findall(r'\\b[a-zA-Z]{4,}\\b', title.lower())
-        for token in tokens:
-            if (token not in english_stopwords and
-                token not in exclusions and
-                token not in country_names):
-                words.append(token)
-    counter = Counter(words)
-    return counter.most_common(top_n)
-")
+saveRDS(topic_info, "no_topic_info_no.rds")
+saveRDS(document_info, "no_document_info_no.rds")
+saveRDS(topic_info_sub, "no_topic_info_sub_no.rds")
+saveRDS(document_info_sub, "no_document_info_sub_no.rds")
 
 
-# Convert Python result to data frame
-top_words_df <- as.data.frame(do.call(rbind, py$top_words), stringsAsFactors = FALSE)
-colnames(top_words_df) <- c("word", "frequency")
 
-# Convert frequency column to numeric
-top_words_df$frequency <- as.numeric(top_words_df$frequency)
-
-words <- unlist(py$top_words)[seq(1, length(unlist(py$top_words)), 2)]
-
-py_run_string("
-import re
-import string
-from sklearn.feature_extraction.text import TfidfVectorizer, ENGLISH_STOP_WORDS
-from sklearn.cluster import MiniBatchKMeans
-import pycountry
-
-# Excluded terms
-excluded_terms = {
-    'death', 'deaths', 'mortality', 'premature', 'study','health', 'disease', 'among', 'analysis',
-    'life', 'based', 'years', 'associated', 'related', 'care', 'year', 'long', 'data', 'quality',
-    'specific', 'effects', 'women', 'outcomes', 'cost', 'impacts', 'alcohol', 'high', 'potential',
-    'results', 'time', 'evidence', 'first', 'low', 'yll', 'age'}
-
-def normalize_and_filter(term):
-    term = term.lower()
-    term = term.translate(str.maketrans('', '', string.punctuation))
-    return [w for w in term.split() if re.fullmatch(r'[a-zA-Z]{3,}', w)]
-
-# Country name parts
-country_words = set()
-for country in pycountry.countries:
-    country_words.update(normalize_and_filter(country.name))
-
-custom_stopwords = ENGLISH_STOP_WORDS.union(country_words).union(excluded_terms)
-custom_stopwords = list(custom_stopwords)
-
-# TF-IDF
-vectorizer = TfidfVectorizer(
-    stop_words=custom_stopwords,
-    max_df=0.8,
-    min_df=5,
-    max_features=10000,
-    token_pattern=r'\\b[a-zA-Z]{3,}\\b'
-)
-X = vectorizer.fit_transform(titles)
-
-# Clustering
-n_clusters = 10
-kmeans = MiniBatchKMeans(n_clusters=n_clusters, random_state=42, batch_size=2048)
-kmeans.fit(X)
-
-feature_names = vectorizer.get_feature_names_out()
-order_centroids = kmeans.cluster_centers_.argsort()[:, ::-1]
-
-# Top keywords per cluster
-top_keywords = []
-for i in range(n_clusters):
-    raw_keywords = [feature_names[ind] for ind in order_centroids[i, :12]]
-    top_keywords.append(raw_keywords[:6])
-
-labels = kmeans.labels_
-# ✅ Export to R
-r.labels = kmeans.labels_
-r.top_keywords = top_keywords
-")
+df$combined_text <- tolower(df$text) # preprocess original text in case
 
 
-cluster_ids_t <- py$labels
-top_keywords_t <- py$top_keywords
+#### STEP 2: Handle SUBTOPIC topic_info ####
+
+# Extract representative texts
+rep_text_sub <- result_sub[[3]]  # subtopic representative_docs
+example_texts_sub <- sapply(rep_text_sub, function(x) if (length(x) > 0) x[[1]] else NA)
+example_texts_sub <- tolower(example_texts_sub)
+
+# Match to original data
+match_indices_sub <- match(example_texts_sub, df$combined_text)
+
+# Add columns to topic_info_sub
+topic_info_sub <- result_sub[[1]]
+topic_info_sub$Representative_Docs <- rep_text_sub
+topic_info_sub$title <- df$title[match_indices_sub]
+topic_info_sub$abstract <- df$abstract[match_indices_sub]
+
+#### STEP 3: Combine and clean ####
+# Remove topic -1 from main topics
+topic_info_main_clean <- subset(topic_info_main, Topic != -1)
+# Combine both sets
+topic_info_final <- rbind(topic_info_main_clean, topic_info_sub)
+
+#topic_info_final <- topic_info_main
 
 
-selection_yll$cluster <- cluster_ids_t
+##############################################################################################
+# export back to Rayyan ----representative articles
+library(RefManageR)
 
-sampled_selection <- selection_yll %>%
-  group_by(cluster) %>%
-  slice_sample(n = 4) %>%
-  ungroup()
+# Step 1: Match topic_info_final titles to your full selection data
+bib_df <- topic_info_final %>%
+  select(title) %>%
+  inner_join(selection, by = "title") %>%
+  distinct(title, .keep_all = TRUE)
 
-############################################################################
-#for observations with no abstract, add to the group with least articles 
-# Determine which cluster has the most articles
-cluster_table <- table(cluster_ids)
-smallest <- as.integer(names(cluster_table)[which.min(cluster_table)])
-# Initialize the cluster column
-selection_yll$cluster <- NA
-# Assign clusters to rows with abstracts
-selection_yll$cluster[!is.na(selection_yll$abstract)] <- cluster_ids
-# Assign the largest cluster to missing abstracts
-selection_yll$cluster[is.na(selection_yll$abstract)] <- smallest
+# Step 2: Prepare fields
+bib_df <- bib_df %>%
+  mutate(
+    bibtype = "Article",
+    bibkey = make.names(title),
+    author = ifelse(!is.null(author), sapply(author, function(x) paste(x, collapse = " and ")), "Unknown"),
+    journal = ifelse("journal" %in% colnames(.), as.character(journal), "Unknown"),
+    year = ifelse("year" %in% colnames(.), as.character(year), "n.d."),
+    title = as.character(title),
+    doi = if ("doi" %in% colnames(.)) as.character(doi) else "",
+    abstract = if ("abstract" %in% colnames(.)) as.character(abstract) else ""
+  )
 
-##############################################################################
-##write out
-setwd(data.dir)
-write_bibliography(ris_data, file = "YLL.ris")
-
-#######
-cluster_keywords <- do.call(rbind, lapply(top_keywords, function(x) {
-  length(x) <- 6 
-  return(x)
+# Step 3: Create one BibEntry per row
+bib_entries <- do.call("c", lapply(seq_len(nrow(bib_df)), function(i) {
+  BibEntry(
+    bibtype = bib_df$bibtype[i],
+    key = bib_df$bibkey[i],
+    title = bib_df$title[i],
+    author = bib_df$author[i],
+    year = bib_df$year[i],
+    journal = bib_df$journal[i],
+    doi = bib_df$doi[i],
+    abstract = bib_df$abstract[i]
+  )
 }))
 
-cluster_keywords <- as.data.frame(cluster_keywords, stringsAsFactors = FALSE)
-colnames(cluster_keywords) <- paste0("keyword_", 1:6)
-cluster_keywords$cluster <- 0:(nrow(cluster_keywords) - 1)  
-cluster_keywords <- cluster_keywords[, c("cluster", paste0("keyword_", 1:6))]
+# Step 4: Save to BibTeX file
+WriteBib(bib_entries, file = "rayyan_ready_no.bib")
 
-# Save to CSV
-setwd(keywords.dir)
-write.csv(cluster_keywords, "YLL.csv", row.names = FALSE)
+##############################################randomly pick one article per no
+sampled_set <- document_info %>%
+  filter(topic!=-1) %>%
+  group_by(topic) %>%
+  slice_sample(n = 1) %>%
+  ungroup() %>%
+  add_row(document_info_sub %>%
+            group_by(topic) %>%
+            slice_sample(n = 1) %>%
+            ungroup())
 
-#################################################################################
-################## random selection
+# 1. Reconstruct combined text for matching
+selection <- selection %>%
+  mutate(combined_text = paste(title, abstract) %>% tolower())
 
-set.seed(42)  # for reproducibility
-# Attach cluster IDs to ris_data (preserving missing abstracts)
-cluster_ids_full <- rep(NA, nrow(ris_data))
-non_missing <- !is.na(ris_data$abstract)
-cluster_ids_full[non_missing] <- py$labels
-ris_data$cluster_id <- cluster_ids_full
+# 2. Join sampled_set with full metadata
+sampled_set_joined <- sampled_set %>%
+  mutate(text = tolower(text)) %>%
+  left_join(selection, by = c("text" = "combined_text"))
 
-# Count articles per cluster (exclude NAs)
-cluster_sizes <- table(na.omit(cluster_ids_full))
-top3_clusters <- as.integer(names(sort(cluster_sizes, decreasing = TRUE)[1:3]))
+# Step 1: Clean and validate fields
+sampled_bib <- sampled_set_joined %>%
+  mutate(
+    bibtype = "Article",
+    bibkey = make.names(title),
+    author = if ("author" %in% names(.)) {
+      sapply(author, function(a) {
+        if (is.null(a) || all(is.na(a))) {
+          "Unknown"
+        } else if (is.character(a)) {
+          paste(a, collapse = " and ")
+        } else if (is.list(a)) {
+          paste(unlist(a), collapse = " and ")
+        } else {
+          "Unknown"
+        }
+      })
+    } else {
+      "Unknown"
+    },
+    journal = if ("journal" %in% names(.)) as.character(journal) else NA_character_,
+    year = if ("year" %in% names(.)) as.character(year) else NA_character_,
+    title = as.character(title),
+    doi = if ("doi" %in% names(.)) as.character(doi) else "",
+    abstract = if ("abstract" %in% names(.)) as.character(abstract) else ""
+  )
 
-# Initialize vector for sampled indices
-sampled_indices <- c()
+# Step 2: Filter rows with valid required fields
+valid_bib <- sampled_bib %>%
+  filter(!is.na(journal), journal != "", !is.na(year), year != "")
 
-# Sample 4 from each cluster (or fewer if not enough)
-for (k in 0:9) {
-  in_cluster <- which(ris_data$cluster_id == k)
-  n_sample <- min(4, length(in_cluster))
-  sampled_indices <- c(sampled_indices, sample(in_cluster, n_sample))
-}
+# Step 3: Log dropped rows (optional)
+dropped <- anti_join(sampled_bib, valid_bib, by = "title")
+cat("Dropped rows due to missing journal or year:\n")
+print(dropped$title)
 
-# Sample 1 extra from each of the top 3 clusters (not already sampled)
-for (k in top3_clusters) {
-  available <- setdiff(which(ris_data$cluster_id == k), sampled_indices)
-  if (length(available) >= 1) {
-    sampled_indices <- c(sampled_indices, sample(available, 1))
-  }
-}
+# Step 4: Create BibEntry list
+bib_entries <- do.call("c", lapply(seq_len(nrow(valid_bib)), function(i) {
+  BibEntry(
+    bibtype = valid_bib$bibtype[i],
+    key     = valid_bib$bibkey[i],
+    title   = valid_bib$title[i],
+    author  = valid_bib$author[i],
+    year    = valid_bib$year[i],
+    journal = valid_bib$journal[i],
+    doi     = valid_bib$doi[i],
+    abstract= valid_bib$abstract[i]
+  )
+}))
 
-# Extract sampled articles
-sampled_articles <- ris_data[sampled_indices, ]
-
-####add 4 because of missing texts available, language etc.
-# Sample 4 new articles not in sampled_articles
-remaining <- ris_data[!(ris_data$doi %in% sampled_articles$doi), ]
-extra_sample <- remaining[sample(nrow(remaining), 4), ]
-
-# Combine into an updated sample
-sampled_articles <- rbind(sampled_articles[,1:23], extra_sample[,-24])
-
-setwd(selected.dir)
-write_bibliography(sampled_articles, file = "sampleYLL.ris")
-
-
+# Step 5: Save BibTeX file
+WriteBib(bib_entries, file = "sampled_articles_no.bib")
 
